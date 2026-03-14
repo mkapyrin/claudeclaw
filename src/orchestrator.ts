@@ -29,8 +29,8 @@ export interface AgentInfo {
 /** Cache of available agents loaded at startup. */
 let agentRegistry: AgentInfo[] = [];
 
-/** Default timeout for a delegated task (5 minutes). */
-const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
+/** Default timeout for a delegated task (10 minutes). */
+const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 
 /**
  * Initialize the orchestrator by scanning `agents/` for valid configs.

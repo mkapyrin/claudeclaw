@@ -2,8 +2,11 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { Api, Bot, Context, InputFile, RawApi } from 'grammy';
+import { autoRetry } from '@grammyjs/auto-retry';
+import { stream, type StreamFlavor } from '@grammyjs/stream';
 
 import { runAgent, UsageInfo, AgentProgressEvent } from './agent.js';
+import { StreamBridge } from './stream-bridge.js';
 import {
   AGENT_ID,
   ALLOWED_CHAT_ID,
@@ -292,7 +295,7 @@ function isAuthorised(chatId: number): boolean {
  * @param forceVoiceReply  When true, always respond with audio (e.g. user sent a voice note).
  * @param skipLog  When true, skip logging this turn to conversation_log (used by /respin to avoid self-referential logging).
  */
-async function handleMessage(ctx: Context, message: string, forceVoiceReply = false, skipLog = false): Promise<void> {
+async function handleMessage(ctx: MyContext, message: string, forceVoiceReply = false, skipLog = false): Promise<void> {
   const chatId = ctx.chat!.id;
   const chatIdStr = chatId.toString();
 
@@ -388,6 +391,15 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
 
   setProcessing(chatIdStr, true);
 
+  const abortCtrl = new AbortController();
+  setActiveAbort(chatIdStr, abortCtrl);
+
+  // Auto-abort if the agent runs too long (prevents runaway commands from blocking the bot)
+  const timeoutId = setTimeout(() => {
+    logger.warn({ chatId: chatIdStr, timeoutMs: AGENT_TIMEOUT_MS }, 'Agent query timed out, aborting');
+    abortCtrl.abort();
+  }, AGENT_TIMEOUT_MS);
+
   try {
     // Progress callback: surface sub-agent lifecycle events to Telegram + SSE
     const onProgress = (event: AgentProgressEvent) => {
@@ -403,23 +415,38 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       }
     };
 
-    const abortCtrl = new AbortController();
-    setActiveAbort(chatIdStr, abortCtrl);
+    // ── Streaming via sendMessageDraft ──────────────────────────────────
+    // Agent text chunks (from assistant events) are pushed into a
+    // StreamBridge and consumed by ctx.replyWithStream() concurrently.
+    // This shows a native Telegram draft bubble that fills up in real-time.
+    // If streaming fails, we fall back to the classic send-after-completion.
+    const bridge = new StreamBridge();
 
-    // Auto-abort if the agent runs too long (prevents runaway commands from blocking the bot)
-    const timeoutId = setTimeout(() => {
-      logger.warn({ chatId: chatIdStr, timeoutMs: AGENT_TIMEOUT_MS }, 'Agent query timed out, aborting');
-      abortCtrl.abort();
-    }, AGENT_TIMEOUT_MS);
-
-    const result = await runAgent(
+    // Start the agent — text chunks are pushed to bridge as they arrive
+    const agentPromise = runAgent(
       fullMessage,
       sessionId,
       () => void sendTyping(ctx.api, chatId),
       onProgress,
       chatModelOverride.get(chatIdStr) ?? agentDefaultModel,
       abortCtrl,
+      (chunk) => bridge.push(chunk),
     );
+
+    // Close bridge when agent finishes (success or failure) so the
+    // stream plugin knows to finalise the draft → real message.
+    const agentWithCleanup = agentPromise.finally(() => bridge.close());
+
+    // Stream draft bubbles to Telegram concurrently with agent execution.
+    // The plugin auto-converts the draft to a real sendMessage on close.
+    const streamPromise: Promise<unknown[]> = ctx.replyWithStream(bridge).catch((err: unknown) => {
+      logger.warn({ err }, 'replyWithStream failed, will fall back to classic send');
+      return [] as unknown[];
+    });
+
+    // Wait for both agent result and stream delivery
+    const [result, streamedMessages] = await Promise.all([agentWithCleanup, streamPromise]);
+    const textDeliveredViaStream = Array.isArray(streamedMessages) && streamedMessages.length > 0;
 
     clearTimeout(timeoutId);
     setActiveAbort(chatIdStr, null);
@@ -432,7 +459,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
         ? `Timed out after ${Math.round(AGENT_TIMEOUT_MS / 1000)}s. The task may have been too complex or a command got stuck. Try breaking it into smaller steps.`
         : 'Stopped.';
       emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: msg, source: 'telegram' });
-      await ctx.reply(msg);
+      if (!textDeliveredViaStream) await ctx.reply(msg);
       return;
     }
 
@@ -479,7 +506,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     const caps = voiceCapabilities();
     const shouldSpeakBack = caps.tts && (forceVoiceReply || voiceEnabledChats.has(chatIdStr));
 
-    // Send text response (if there's any left after stripping markers)
+    // Send text response — skip if already delivered via streaming
     if (responseText) {
       if (shouldSpeakBack) {
         try {
@@ -487,11 +514,14 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
           await ctx.replyWithVoice(new InputFile(audioBuffer, 'response.ogg'));
         } catch (ttsErr) {
           logger.error({ err: ttsErr }, 'TTS failed, falling back to text');
-          for (const part of splitMessage(formatForTelegram(responseText))) {
-            await ctx.reply(part, { parse_mode: 'HTML' });
+          if (!textDeliveredViaStream) {
+            for (const part of splitMessage(formatForTelegram(responseText))) {
+              await ctx.reply(part, { parse_mode: 'HTML' });
+            }
           }
         }
-      } else {
+      } else if (!textDeliveredViaStream) {
+        // Streaming didn't work or wasn't used — send formatted HTML
         for (const part of splitMessage(formatForTelegram(responseText))) {
           await ctx.reply(part, { parse_mode: 'HTML' });
         }
@@ -526,6 +556,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     setProcessing(chatIdStr, false);
   } catch (err) {
     clearInterval(typingInterval);
+    clearTimeout(timeoutId);
     setActiveAbort(chatIdStr, null);
     setProcessing(chatIdStr, false);
     logger.error({ err }, 'Agent error');
@@ -602,13 +633,19 @@ function discoverSkillCommands(): Array<{ command: string; description: string }
   return commands.sort((a, b) => a.command.localeCompare(b.command));
 }
 
-export function createBot(): Bot {
+type MyContext = StreamFlavor<Context>;
+
+export function createBot(): Bot<MyContext> {
   const token = activeBotToken;
   if (!token) {
     throw new Error('Bot token is not set. Check .env or agent config.');
   }
 
-  const bot = new Bot(token);
+  const bot = new Bot<MyContext>(token);
+
+  // Install auto-retry (handles Telegram rate limits) and stream plugin
+  bot.api.config.use(autoRetry());
+  bot.use(stream());
 
   // Register commands in the Telegram menu (built-in + auto-discovered skills)
   const builtInCommands = [
@@ -1112,6 +1149,14 @@ export function createBot(): Bot {
     // Clear WA/Slack state and pass through to Claude
     if (state) waState.delete(chatIdStr);
     if (slkState) slackState.delete(chatIdStr);
+
+    // Check if another message is already being processed for this chat.
+    // If so, notify the user that their message was received and queued.
+    const queuedCount = messageQueue.queuedFor(chatIdStr);
+    if (queuedCount > 0) {
+      void ctx.reply(`📥 Queued (#${queuedCount + 1}). Use /stop to interrupt current task.`).catch(() => {});
+    }
+
     // Fire-and-forget so grammY can process /stop while agent runs
     messageQueue.enqueue(chatIdStr, () => handleMessage(ctx, text));
   });

@@ -108,6 +108,7 @@ export async function runAgent(
   onProgress?: (event: AgentProgressEvent) => void,
   model?: string,
   abortController?: AbortController,
+  onText?: (chunk: string) => void,
 ): Promise<AgentResult> {
   // Read secrets from .env without polluting process.env.
   // CLAUDE_CODE_OAUTH_TOKEN is optional — the subprocess finds auth via ~/.claude/
@@ -197,6 +198,21 @@ export async function runAgent(
         }
         if (callInputTokens > 0) {
           lastCallInputTokens = callInputTokens;
+        }
+      }
+
+      // Stream text content from assistant messages to the onText callback.
+      // In multi-step tool-use flows, text appears between tool calls;
+      // in single-step responses, it arrives as one chunk before the result event.
+      if (ev['type'] === 'assistant' && onText) {
+        const msg = ev['message'] as Record<string, unknown> | undefined;
+        const content = msg?.['content'] as Array<{ type: string; text?: string }> | undefined;
+        if (content) {
+          for (const block of content) {
+            if (block.type === 'text' && block.text) {
+              onText(block.text);
+            }
+          }
         }
       }
 

@@ -105,9 +105,9 @@ export const TYPING_REFRESH_MS = 4000;
 
 // Maximum time (ms) an agent query can run before being auto-aborted.
 // Prevents runaway commands (e.g. recursive `find /`) from blocking the bot indefinitely.
-// Default: 5 minutes. Override via AGENT_TIMEOUT_MS in .env.
+// Default: 10 minutes. Override via AGENT_TIMEOUT_MS in .env.
 export const AGENT_TIMEOUT_MS = parseInt(
-  process.env.AGENT_TIMEOUT_MS || envConfig.AGENT_TIMEOUT_MS || '300000',
+  process.env.AGENT_TIMEOUT_MS || envConfig.AGENT_TIMEOUT_MS || '600000',
   10,
 );
 
