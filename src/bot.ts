@@ -415,23 +415,37 @@ async function handleMessage(ctx: MyContext, message: string, forceVoiceReply = 
     };
 
     // ── Live activity streaming ─────────────────────────────────────────
-    // Shows a live-updating message in Telegram with Claude's activity:
-    // tool calls (📖 Read, ⚡ Bash, etc.) and thinking text.
-    // Uses send + editMessageText for universal client compatibility.
-    // When done, the activity message is deleted and the final formatted
-    // response is sent as a new message.
+    // Shows Claude's activity in real-time: tool calls and thinking text.
+    // Strategy: try sendMessageDraft first (native draft bubble), fall back
+    // to send + editMessageText if drafts aren't supported.
     let activityLog = '';
     let activityMsgId: number | null = null;
     let activityDirty = false;
     let activityTimer: ReturnType<typeof setInterval> | null = null;
+    let draftSupported: boolean | null = null; // null = unknown, try draft first
     const ACTIVITY_INTERVAL_MS = 500;
 
     const flushActivity = async () => {
       if (!activityDirty || !activityLog) return;
       activityDirty = false;
-      // Show the tail of the log (leave room for Telegram's 4096 limit)
       const visible = activityLog.length > 3800 ? '…' + activityLog.slice(-3800) : activityLog;
       try {
+        // Try sendMessageDraft first (native streaming bubble)
+        if (draftSupported !== false) {
+          try {
+            await ctx.api.raw.sendMessageDraft({
+              chat_id: chatId,
+              draft_id: chatId,
+              text: visible,
+            });
+            draftSupported = true;
+            return;
+          } catch {
+            // Draft not supported — fall back to editMessageText
+            draftSupported = false;
+          }
+        }
+        // Fallback: send + edit a regular message
         if (!activityMsgId) {
           const sent = await ctx.api.sendMessage(chatId, visible);
           activityMsgId = sent.message_id;
@@ -439,7 +453,7 @@ async function handleMessage(ctx: MyContext, message: string, forceVoiceReply = 
           await ctx.api.editMessageText(chatId, activityMsgId, visible).catch(() => {});
         }
       } catch {
-        // Ignore edit/send failures
+        // Ignore send/edit failures
       }
     };
 
@@ -447,7 +461,6 @@ async function handleMessage(ctx: MyContext, message: string, forceVoiceReply = 
       activityLog += line;
       activityDirty = true;
       if (!activityTimer) {
-        // First activity — flush immediately, then on interval
         void flushActivity();
         activityTimer = setInterval(() => void flushActivity(), ACTIVITY_INTERVAL_MS);
       }
@@ -463,9 +476,15 @@ async function handleMessage(ctx: MyContext, message: string, forceVoiceReply = 
       pushActivity,
     );
 
-    // Stop activity updates and clean up the activity message
+    // Stop activity updates
     if (activityTimer) clearInterval(activityTimer);
-    if (activityMsgId) {
+    // Final flush to show complete activity log
+    activityDirty = true;
+    await flushActivity();
+    // Delete activity message only if draft was used (real message replaces draft)
+    // or if it was a fallback message (keep it for user context)
+    if (activityMsgId && !result.aborted) {
+      // Delete the activity message — final response follows
       ctx.api.deleteMessage(chatId, activityMsgId).catch(() => {});
     }
     clearTimeout(timeoutId);
