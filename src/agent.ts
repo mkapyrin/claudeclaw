@@ -233,6 +233,11 @@ export async function runAgent(
         }
       }
 
+      // Log all event types for debugging streaming
+      if (onActivity) {
+        logger.debug({ eventType: ev['type'], subtype: ev['subtype'] }, 'SDK event');
+      }
+
       // Stream live activity from assistant messages: both text and tool_use blocks.
       // This gives a terminal-like view of what Claude is doing in real-time.
       if (ev['type'] === 'assistant' && onActivity) {
