@@ -58,6 +58,38 @@ function toolLabel(toolName: string): string {
   return toolName;
 }
 
+/** Format a tool_use block into a concise terminal-like activity line. */
+function formatToolActivity(name: string, input?: Record<string, unknown>): string {
+  const p = (key: string) => (input?.[key] as string) ?? '';
+  switch (name) {
+    case 'Read':
+      return `\n📖 ${p('file_path')}\n`;
+    case 'Write':
+      return `\n📝 ${p('file_path')}\n`;
+    case 'Edit':
+      return `\n✏️ ${p('file_path')}\n`;
+    case 'Bash': {
+      const cmd = p('command');
+      return `\n⚡ ${cmd.length > 120 ? cmd.slice(0, 120) + '…' : cmd}\n`;
+    }
+    case 'Grep':
+      return `\n🔍 ${p('pattern')}${p('path') ? ` in ${p('path')}` : ''}\n`;
+    case 'Glob':
+      return `\n📂 ${p('pattern')}\n`;
+    case 'Agent':
+      return `\n🤖 ${(p('description') || p('prompt')).slice(0, 80)}\n`;
+    case 'WebFetch':
+      return `\n🌐 ${p('url')}\n`;
+    case 'WebSearch':
+      return `\n🔎 ${p('query')}\n`;
+    default: {
+      // MCP tools or unknown
+      const label = toolLabel(name);
+      return `\n🔧 ${label}\n`;
+    }
+  }
+}
+
 export interface AgentResult {
   text: string | null;
   newSessionId: string | undefined;
@@ -108,7 +140,7 @@ export async function runAgent(
   onProgress?: (event: AgentProgressEvent) => void,
   model?: string,
   abortController?: AbortController,
-  onText?: (chunk: string) => void,
+  onActivity?: (line: string) => void,
 ): Promise<AgentResult> {
   // Read secrets from .env without polluting process.env.
   // CLAUDE_CODE_OAUTH_TOKEN is optional — the subprocess finds auth via ~/.claude/
@@ -201,16 +233,19 @@ export async function runAgent(
         }
       }
 
-      // Stream text content from assistant messages to the onText callback.
-      // In multi-step tool-use flows, text appears between tool calls;
-      // in single-step responses, it arrives as one chunk before the result event.
-      if (ev['type'] === 'assistant' && onText) {
+      // Stream live activity from assistant messages: both text and tool_use blocks.
+      // This gives a terminal-like view of what Claude is doing in real-time.
+      if (ev['type'] === 'assistant' && onActivity) {
         const msg = ev['message'] as Record<string, unknown> | undefined;
-        const content = msg?.['content'] as Array<{ type: string; text?: string }> | undefined;
+        const content = msg?.['content'] as Array<Record<string, unknown>> | undefined;
         if (content) {
           for (const block of content) {
-            if (block.type === 'text' && block.text) {
-              onText(block.text);
+            if (block['type'] === 'text' && block['text']) {
+              onActivity(block['text'] as string);
+            } else if (block['type'] === 'tool_use') {
+              const name = block['name'] as string;
+              const input = block['input'] as Record<string, unknown> | undefined;
+              onActivity(formatToolActivity(name, input));
             }
           }
         }

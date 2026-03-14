@@ -6,7 +6,6 @@ import { autoRetry } from '@grammyjs/auto-retry';
 import { stream, type StreamFlavor } from '@grammyjs/stream';
 
 import { runAgent, UsageInfo, AgentProgressEvent } from './agent.js';
-import { StreamBridge } from './stream-bridge.js';
 import {
   AGENT_ID,
   ALLOWED_CHAT_ID,
@@ -415,39 +414,60 @@ async function handleMessage(ctx: MyContext, message: string, forceVoiceReply = 
       }
     };
 
-    // ── Streaming via sendMessageDraft ──────────────────────────────────
-    // Agent text chunks (from assistant events) are pushed into a
-    // StreamBridge and consumed by ctx.replyWithStream() concurrently.
-    // This shows a native Telegram draft bubble that fills up in real-time.
-    // If streaming fails, we fall back to the classic send-after-completion.
-    const bridge = new StreamBridge();
+    // ── Live activity streaming ─────────────────────────────────────────
+    // Shows a live-updating message in Telegram with Claude's activity:
+    // tool calls (📖 Read, ⚡ Bash, etc.) and thinking text.
+    // Uses send + editMessageText for universal client compatibility.
+    // When done, the activity message is deleted and the final formatted
+    // response is sent as a new message.
+    let activityLog = '';
+    let activityMsgId: number | null = null;
+    let activityDirty = false;
+    let activityTimer: ReturnType<typeof setInterval> | null = null;
+    const ACTIVITY_INTERVAL_MS = 500;
 
-    // Start the agent — text chunks are pushed to bridge as they arrive
-    const agentPromise = runAgent(
+    const flushActivity = async () => {
+      if (!activityDirty || !activityLog) return;
+      activityDirty = false;
+      // Show the tail of the log (leave room for Telegram's 4096 limit)
+      const visible = activityLog.length > 3800 ? '…' + activityLog.slice(-3800) : activityLog;
+      try {
+        if (!activityMsgId) {
+          const sent = await ctx.api.sendMessage(chatId, visible);
+          activityMsgId = sent.message_id;
+        } else {
+          await ctx.api.editMessageText(chatId, activityMsgId, visible).catch(() => {});
+        }
+      } catch {
+        // Ignore edit/send failures
+      }
+    };
+
+    const pushActivity = (line: string) => {
+      activityLog += line;
+      activityDirty = true;
+      if (!activityTimer) {
+        // First activity — flush immediately, then on interval
+        void flushActivity();
+        activityTimer = setInterval(() => void flushActivity(), ACTIVITY_INTERVAL_MS);
+      }
+    };
+
+    const result = await runAgent(
       fullMessage,
       sessionId,
       () => void sendTyping(ctx.api, chatId),
       onProgress,
       chatModelOverride.get(chatIdStr) ?? agentDefaultModel,
       abortCtrl,
-      (chunk) => bridge.push(chunk),
+      pushActivity,
     );
 
-    // Close bridge when agent finishes (success or failure) so the
-    // stream plugin knows to finalise the draft → real message.
-    const agentWithCleanup = agentPromise.finally(() => bridge.close());
-
-    // Stream draft bubbles to Telegram concurrently with agent execution.
-    // The plugin auto-converts the draft to a real sendMessage on close.
-    const streamPromise: Promise<unknown[]> = ctx.replyWithStream(bridge).catch((err: unknown) => {
-      logger.warn({ err }, 'replyWithStream failed, will fall back to classic send');
-      return [] as unknown[];
-    });
-
-    // Wait for both agent result and stream delivery
-    const [result, streamedMessages] = await Promise.all([agentWithCleanup, streamPromise]);
-    const textDeliveredViaStream = Array.isArray(streamedMessages) && streamedMessages.length > 0;
-
+    // Stop activity updates and clean up the activity message
+    if (activityTimer) clearInterval(activityTimer);
+    if (activityMsgId) {
+      ctx.api.deleteMessage(chatId, activityMsgId).catch(() => {});
+    }
     clearTimeout(timeoutId);
     setActiveAbort(chatIdStr, null);
     clearInterval(typingInterval);
@@ -459,7 +479,7 @@ async function handleMessage(ctx: MyContext, message: string, forceVoiceReply = 
         ? `Timed out after ${Math.round(AGENT_TIMEOUT_MS / 1000)}s. The task may have been too complex or a command got stuck. Try breaking it into smaller steps.`
         : 'Stopped.';
       emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: msg, source: 'telegram' });
-      if (!textDeliveredViaStream) await ctx.reply(msg);
+      await ctx.reply(msg);
       return;
     }
 
@@ -506,7 +526,8 @@ async function handleMessage(ctx: MyContext, message: string, forceVoiceReply = 
     const caps = voiceCapabilities();
     const shouldSpeakBack = caps.tts && (forceVoiceReply || voiceEnabledChats.has(chatIdStr));
 
-    // Send text response — skip if already delivered via streaming
+    // Send final response as formatted HTML message.
+    // The sendMessage replaces the draft bubble in the chat.
     if (responseText) {
       if (shouldSpeakBack) {
         try {
@@ -514,14 +535,11 @@ async function handleMessage(ctx: MyContext, message: string, forceVoiceReply = 
           await ctx.replyWithVoice(new InputFile(audioBuffer, 'response.ogg'));
         } catch (ttsErr) {
           logger.error({ err: ttsErr }, 'TTS failed, falling back to text');
-          if (!textDeliveredViaStream) {
-            for (const part of splitMessage(formatForTelegram(responseText))) {
-              await ctx.reply(part, { parse_mode: 'HTML' });
-            }
+          for (const part of splitMessage(formatForTelegram(responseText))) {
+            await ctx.reply(part, { parse_mode: 'HTML' });
           }
         }
-      } else if (!textDeliveredViaStream) {
-        // Streaming didn't work or wasn't used — send formatted HTML
+      } else {
         for (const part of splitMessage(formatForTelegram(responseText))) {
           await ctx.reply(part, { parse_mode: 'HTML' });
         }
