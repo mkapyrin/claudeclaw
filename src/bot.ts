@@ -457,12 +457,15 @@ async function handleMessage(ctx: MyContext, message: string, forceVoiceReply = 
       }
     };
 
+    // Queue of pending flush promises so we can await the last one after runAgent
+    let lastFlush: Promise<void> = Promise.resolve();
+
     const pushActivity = (line: string) => {
       activityLog += line;
       activityDirty = true;
       if (!activityTimer) {
-        void flushActivity();
-        activityTimer = setInterval(() => void flushActivity(), ACTIVITY_INTERVAL_MS);
+        lastFlush = flushActivity();
+        activityTimer = setInterval(() => { lastFlush = flushActivity(); }, ACTIVITY_INTERVAL_MS);
       }
     };
 
@@ -476,17 +479,17 @@ async function handleMessage(ctx: MyContext, message: string, forceVoiceReply = 
       pushActivity,
     );
 
-    // Stop activity updates
+    // Stop activity updates — await any in-flight flush first
     if (activityTimer) clearInterval(activityTimer);
-    // Final flush to show complete activity log
-    activityDirty = true;
-    await flushActivity();
-    // Delete activity message only if draft was used (real message replaces draft)
-    // or if it was a fallback message (keep it for user context)
-    if (activityMsgId && !result.aborted) {
-      // Delete the activity message — final response follows
-      ctx.api.deleteMessage(chatId, activityMsgId).catch(() => {});
+    await lastFlush;
+    // Final flush to ensure activity log is visible
+    if (activityLog && !activityMsgId && draftSupported !== true) {
+      // Activity was pushed but never flushed (fast responses) — send now
+      activityDirty = true;
+      await flushActivity();
     }
+    // Keep activity message visible briefly so user can see what happened,
+    // then delete it after the final response is sent (handled below after reply)
     clearTimeout(timeoutId);
     setActiveAbort(chatIdStr, null);
     clearInterval(typingInterval);
@@ -563,6 +566,11 @@ async function handleMessage(ctx: MyContext, message: string, forceVoiceReply = 
           await ctx.reply(part, { parse_mode: 'HTML' });
         }
       }
+    }
+
+    // Clean up activity message after final response is sent
+    if (activityMsgId) {
+      ctx.api.deleteMessage(chatId, activityMsgId).catch(() => {});
     }
 
     // Log token usage to SQLite and check for context warnings
