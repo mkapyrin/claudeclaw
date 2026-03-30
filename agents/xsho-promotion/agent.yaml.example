@@ -1,0 +1,8 @@
+name: xsho-promotion
+description: Яндекс.Директ аналитика и оптимизация рекламных кампаний ШОО
+
+# The env var name in .env that holds this agent's Telegram bot token.
+telegram_bot_token_env: XSHO_MANAGER_BOT_TOKEN
+
+# Default model. Options: claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5
+model: claude-sonnet-4-6
