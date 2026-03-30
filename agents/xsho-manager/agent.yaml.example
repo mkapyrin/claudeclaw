@@ -1,4 +1,4 @@
-name: xsho-promotion
+name: xsho-manager
 description: Яндекс.Директ аналитика и оптимизация рекламных кампаний ШОО
 
 # The env var name in .env that holds this agent's Telegram bot token.
