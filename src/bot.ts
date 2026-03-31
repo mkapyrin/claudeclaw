@@ -19,6 +19,8 @@ import {
   agentSystemPrompt,
   TYPING_REFRESH_MS,
   AGENT_TIMEOUT_MS,
+  AGENT_MAX_RUNTIME_MS,
+  MAX_QUEUE_DEPTH,
 } from './config.js';
 import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage } from './db.js';
 import { logger } from './logger.js';
@@ -396,6 +398,13 @@ async function handleMessage(ctx: MyContext, message: string, forceVoiceReply = 
   let activityTimer: ReturnType<typeof setInterval> | null = null;
   let statusTimer: ReturnType<typeof setInterval> | null = null;
 
+  // Hard safety timeout — last resort kill for zombie subprocesses
+  const safetyTimeout = setTimeout(() => {
+    const elapsed = Math.round(AGENT_MAX_RUNTIME_MS / 60_000);
+    logger.warn({ chatId: chatIdStr, elapsed }, 'Agent hit safety timeout, aborting');
+    abortCtrl.abort();
+  }, AGENT_MAX_RUNTIME_MS);
+
   try {
     // Progress callback: surface sub-agent lifecycle events to Telegram + SSE
     const onProgress = (event: AgentProgressEvent) => {
@@ -499,15 +508,20 @@ async function handleMessage(ctx: MyContext, message: string, forceVoiceReply = 
       activityDirty = true;
       await flushActivity();
     }
+    clearTimeout(safetyTimeout);
     setActiveAbort(chatIdStr, null);
     clearInterval(typingInterval);
 
     const durationSec = Math.round((Date.now() - taskStartTime) / 1000);
 
-    // Handle abort (manual /stop only — no auto-timeout)
+    // Handle abort (manual /stop or safety timeout)
     if (result.aborted) {
       setProcessing(chatIdStr, false);
-      await ctx.reply(`Stopped after ${durationSec}s.`);
+      const isTimeout = durationSec >= Math.round(AGENT_MAX_RUNTIME_MS / 1000) - 5;
+      const msg = isTimeout
+        ? `Safety timeout after ${Math.round(durationSec / 60)} min. Task was auto-stopped to prevent zombie process. Use /stop to interrupt earlier.`
+        : `Stopped after ${durationSec}s.`;
+      await ctx.reply(msg);
       return;
     }
 
@@ -617,6 +631,7 @@ async function handleMessage(ctx: MyContext, message: string, forceVoiceReply = 
     setProcessing(chatIdStr, false);
   } catch (err) {
     clearInterval(typingInterval);
+    clearTimeout(safetyTimeout);
     if (activityTimer) clearInterval(activityTimer);
     if (statusTimer) clearInterval(statusTimer);
     setActiveAbort(chatIdStr, null);
@@ -1213,8 +1228,11 @@ export function createBot(): Bot<MyContext> {
     if (slkState) slackState.delete(chatIdStr);
 
     // Check if another message is already being processed for this chat.
-    // If so, notify the user that their message was received and queued.
     const queuedCount = messageQueue.queuedFor(chatIdStr);
+    if (queuedCount >= MAX_QUEUE_DEPTH) {
+      void ctx.reply(`Queue full (${queuedCount}). Use /stop to interrupt current task, or wait.`).catch(() => {});
+      return;
+    }
     if (queuedCount > 0) {
       void ctx.reply(`📥 Queued (#${queuedCount + 1}). Use /stop to interrupt current task.`).catch(() => {});
     }

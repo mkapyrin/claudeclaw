@@ -106,8 +106,23 @@ export const TYPING_REFRESH_MS = 4000;
 // Maximum time (ms) an agent query can run before being auto-aborted.
 // Prevents runaway commands (e.g. recursive `find /`) from blocking the bot indefinitely.
 // Default: 10 minutes. Override via AGENT_TIMEOUT_MS in .env.
+// Used only for dashboard messages. Telegram messages use AGENT_MAX_RUNTIME_MS.
 export const AGENT_TIMEOUT_MS = parseInt(
   process.env.AGENT_TIMEOUT_MS || envConfig.AGENT_TIMEOUT_MS || '600000',
+  10,
+);
+
+// Hard safety limit for Telegram agent queries (default: 1 hour).
+// Prevents zombie subprocesses from blocking the bot indefinitely.
+// Normal tasks get periodic status updates; this is a last-resort kill.
+export const AGENT_MAX_RUNTIME_MS = parseInt(
+  process.env.AGENT_MAX_RUNTIME_MS || '3600000',
+  10,
+);
+
+// Max queued messages per chat before rejecting new ones.
+export const MAX_QUEUE_DEPTH = parseInt(
+  process.env.MAX_QUEUE_DEPTH || '5',
   10,
 );
 
