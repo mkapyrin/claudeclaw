@@ -58,6 +58,15 @@ function toolLabel(toolName: string): string {
   return toolName;
 }
 
+/** Redact common secret patterns from activity strings. */
+function redactSecrets(s: string): string {
+  return s
+    // Bearer/API tokens
+    .replace(/(Bearer\s+|sk-ant-|sk-|xoxp-|xoxb-|ghp_|gho_|AKIA)\S{6,}/gi, '$1***')
+    // Generic key=value secrets
+    .replace(/(api[_-]?key|token|secret|password|credential)[=: ]["']?\S{8,}/gi, '$1=***');
+}
+
 /** Format a tool_use block into a concise terminal-like activity line. */
 function formatToolActivity(name: string, input?: Record<string, unknown>): string {
   const p = (key: string) => (input?.[key] as string) ?? '';
@@ -69,7 +78,7 @@ function formatToolActivity(name: string, input?: Record<string, unknown>): stri
     case 'Edit':
       return `\n✏️ ${p('file_path')}\n`;
     case 'Bash': {
-      const cmd = p('command');
+      const cmd = redactSecrets(p('command'));
       return `\n⚡ ${cmd.length > 120 ? cmd.slice(0, 120) + '…' : cmd}\n`;
     }
     case 'Grep':

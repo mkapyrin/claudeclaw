@@ -458,6 +458,10 @@ async function handleMessage(ctx: MyContext, message: string, forceVoiceReply = 
 
     const pushActivity = (line: string) => {
       activityLog += line;
+      // Cap in-memory log to prevent unbounded growth on very long tasks
+      if (activityLog.length > 100_000) {
+        activityLog = '…' + activityLog.slice(-80_000);
+      }
       activityDirty = true;
       if (!activityTimer) {
         lastFlush = flushActivity();
@@ -580,7 +584,8 @@ async function handleMessage(ctx: MyContext, message: string, forceVoiceReply = 
       const mins = Math.floor(durationSec / 60);
       const secs = durationSec % 60;
       const duration = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
-      const cost = result.usage.totalCostUsd > 0 ? ` | $${result.usage.totalCostUsd.toFixed(2)}` : '';
+      const costVal = result.usage.totalCostUsd;
+      const cost = costVal > 0.005 ? ` | $${costVal.toFixed(2)}` : costVal > 0 ? ` | $${costVal.toFixed(4)}` : '';
       await ctx.reply(`✅ ${duration}${cost}`);
     }
 
