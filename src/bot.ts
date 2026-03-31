@@ -392,12 +392,9 @@ async function handleMessage(ctx: MyContext, message: string, forceVoiceReply = 
 
   const abortCtrl = new AbortController();
   setActiveAbort(chatIdStr, abortCtrl);
-
-  // Auto-abort if the agent runs too long (prevents runaway commands from blocking the bot)
-  const timeoutId = setTimeout(() => {
-    logger.warn({ chatId: chatIdStr, timeoutMs: AGENT_TIMEOUT_MS }, 'Agent query timed out, aborting');
-    abortCtrl.abort();
-  }, AGENT_TIMEOUT_MS);
+  const taskStartTime = Date.now();
+  let activityTimer: ReturnType<typeof setInterval> | null = null;
+  let statusTimer: ReturnType<typeof setInterval> | null = null;
 
   try {
     // Progress callback: surface sub-agent lifecycle events to Telegram + SSE
@@ -421,7 +418,6 @@ async function handleMessage(ctx: MyContext, message: string, forceVoiceReply = 
     let activityLog = '';
     let activityMsgId: number | null = null;
     let activityDirty = false;
-    let activityTimer: ReturnType<typeof setInterval> | null = null;
     let draftSupported: boolean | null = null; // null = unknown, try draft first
     const ACTIVITY_INTERVAL_MS = 500;
 
@@ -469,6 +465,17 @@ async function handleMessage(ctx: MyContext, message: string, forceVoiceReply = 
       }
     };
 
+    // ── Periodic status updates (every 10 min for long tasks) ──────────
+    const STATUS_INTERVAL_MS = 10 * 60 * 1000;
+    let statusCount = 0;
+    statusTimer = setInterval(() => {
+      statusCount++;
+      const elapsed = Math.round((Date.now() - taskStartTime) / 60_000);
+      const recentActivity = activityLog.slice(-500).trim();
+      const statusMsg = `⏱ ${elapsed} min | Status #${statusCount}\n${recentActivity || 'Working...'}`;
+      void ctx.reply(statusMsg).catch(() => {});
+    }, STATUS_INTERVAL_MS);
+
     const result = await runAgent(
       fullMessage,
       sessionId,
@@ -479,29 +486,24 @@ async function handleMessage(ctx: MyContext, message: string, forceVoiceReply = 
       pushActivity,
     );
 
-    // Stop activity updates — await any in-flight flush first
+    // Stop all timers
+    clearInterval(statusTimer);
     if (activityTimer) clearInterval(activityTimer);
     await lastFlush;
     // Final flush to ensure activity log is visible
     if (activityLog && !activityMsgId && draftSupported !== true) {
-      // Activity was pushed but never flushed (fast responses) — send now
       activityDirty = true;
       await flushActivity();
     }
-    // Keep activity message visible briefly so user can see what happened,
-    // then delete it after the final response is sent (handled below after reply)
-    clearTimeout(timeoutId);
     setActiveAbort(chatIdStr, null);
     clearInterval(typingInterval);
 
-    // Handle abort (manual /stop or timeout)
+    const durationSec = Math.round((Date.now() - taskStartTime) / 1000);
+
+    // Handle abort (manual /stop only — no auto-timeout)
     if (result.aborted) {
       setProcessing(chatIdStr, false);
-      const msg = result.text === null
-        ? `Timed out after ${Math.round(AGENT_TIMEOUT_MS / 1000)}s. The task may have been too complex or a command got stuck. Try breaking it into smaller steps.`
-        : 'Stopped.';
-      emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: msg, source: 'telegram' });
-      await ctx.reply(msg);
+      await ctx.reply(`Stopped after ${durationSec}s.`);
       return;
     }
 
@@ -573,6 +575,15 @@ async function handleMessage(ctx: MyContext, message: string, forceVoiceReply = 
       ctx.api.deleteMessage(chatId, activityMsgId).catch(() => {});
     }
 
+    // Completion report for long tasks (>30s)
+    if (durationSec > 30 && result.usage) {
+      const mins = Math.floor(durationSec / 60);
+      const secs = durationSec % 60;
+      const duration = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+      const cost = result.usage.totalCostUsd > 0 ? ` | $${result.usage.totalCostUsd.toFixed(2)}` : '';
+      await ctx.reply(`✅ ${duration}${cost}`);
+    }
+
     // Log token usage to SQLite and check for context warnings
     if (result.usage) {
       const activeSessionId = result.newSessionId ?? sessionId;
@@ -601,7 +612,8 @@ async function handleMessage(ctx: MyContext, message: string, forceVoiceReply = 
     setProcessing(chatIdStr, false);
   } catch (err) {
     clearInterval(typingInterval);
-    clearTimeout(timeoutId);
+    if (activityTimer) clearInterval(activityTimer);
+    if (statusTimer) clearInterval(statusTimer);
     setActiveAbort(chatIdStr, null);
     setProcessing(chatIdStr, false);
     logger.error({ err }, 'Agent error');
