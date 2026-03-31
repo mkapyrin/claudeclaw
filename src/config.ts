@@ -19,6 +19,10 @@ const envConfig = readEnvFile([
   'CLAUDECLAW_CONFIG',
   'DB_ENCRYPTION_KEY',
   'GOOGLE_API_KEY',
+  'AGENT_TIMEOUT_MS',
+  'SECURITY_PIN_HASH',
+  'IDLE_LOCK_MINUTES',
+  'EMERGENCY_KILL_PHRASE',
 ]);
 
 // ── Multi-agent support ──────────────────────────────────────────────
@@ -103,12 +107,12 @@ export const MAX_MESSAGE_LENGTH = 4096;
 // Telegram's typing action expires after ~5s, so 4s keeps it continuous.
 export const TYPING_REFRESH_MS = 4000;
 
-// Maximum time (ms) an agent query can run before being auto-aborted.
-// Prevents runaway commands (e.g. recursive `find /`) from blocking the bot indefinitely.
-// Default: 10 minutes. Override via AGENT_TIMEOUT_MS in .env.
-// Used only for dashboard messages. Telegram messages use AGENT_MAX_RUNTIME_MS.
+// Maximum time (ms) for dashboard agent queries.
+// Safety net for truly stuck commands (e.g. recursive `find /`).
+// Default: 15 minutes. Previously 5 min, which caused mid-execution timeouts
+// on bulk API work (posting YouTube comments) leading to duplicate posts.
 export const AGENT_TIMEOUT_MS = parseInt(
-  process.env.AGENT_TIMEOUT_MS || envConfig.AGENT_TIMEOUT_MS || '600000',
+  process.env.AGENT_TIMEOUT_MS || envConfig.AGENT_TIMEOUT_MS || '900000',
   10,
 );
 
@@ -150,3 +154,28 @@ export const DB_ENCRYPTION_KEY =
 // Google API key for Gemini (memory extraction + consolidation)
 export const GOOGLE_API_KEY =
   process.env.GOOGLE_API_KEY || envConfig.GOOGLE_API_KEY || '';
+
+// Streaming strategy for progressive Telegram updates.
+// 'global-throttle' (default): edits a placeholder message with streamed text,
+//   rate-limited to ~24 edits/min per chat to respect Telegram limits.
+// 'single-agent-only': streaming disabled when multiple agents are active on same chat.
+// 'off': no streaming, wait for full response.
+export type StreamStrategy = 'global-throttle' | 'single-agent-only' | 'off';
+export const STREAM_STRATEGY: StreamStrategy =
+  (process.env.STREAM_STRATEGY || 'off') as StreamStrategy;
+
+// ── Security ─────────────────────────────────────────────────────────
+// PIN lock: SHA-256 hash of your PIN. Generate: node -e "console.log(require('crypto').createHash('sha256').update('YOUR_PIN').digest('hex'))"
+export const SECURITY_PIN_HASH =
+  process.env.SECURITY_PIN_HASH || envConfig.SECURITY_PIN_HASH || '';
+
+// Auto-lock after N minutes of inactivity. 0 = disabled. Only active when PIN is set.
+export const IDLE_LOCK_MINUTES = parseInt(
+  process.env.IDLE_LOCK_MINUTES || envConfig.IDLE_LOCK_MINUTES || '0',
+  10,
+);
+
+// Emergency kill phrase. Sending this to any bot immediately stops all agents and exits.
+export const EMERGENCY_KILL_PHRASE =
+  process.env.EMERGENCY_KILL_PHRASE || envConfig.EMERGENCY_KILL_PHRASE || '';
+
