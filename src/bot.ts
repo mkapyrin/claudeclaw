@@ -309,7 +309,9 @@ function isAuthorised(chatId: number): boolean {
     // Not yet configured — let every request through but warn in the reply handler
     return true;
   }
-  return chatId.toString() === ALLOWED_CHAT_ID;
+  // Support comma-separated list of chat IDs
+  const allowed = ALLOWED_CHAT_ID.split(',').map((s) => s.trim());
+  return allowed.includes(chatId.toString());
 }
 
 /**
